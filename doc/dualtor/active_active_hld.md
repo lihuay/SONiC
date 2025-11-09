@@ -10,6 +10,7 @@ Active-active dual ToR link manager is an evolution of active-standby dual ToR l
 |  0.2  | 12/02/22 | Longxiang Lyu | Add Traffic Forwarding section |
 |  0.3  | 12/08/22 | Longxiang Lyu | Add BGP update delay section   |
 |  0.4  | 12/13/22 | Longxiang Lyu | Add skip ACL section           |
+|  0.5  | 04/10/23 | Longxiang Lyu | Add command line section       |
 
 ## Scope 
 This document provides the high level design of SONiC dual toR solution, supporting active-active setup. 
@@ -41,6 +42,7 @@ This document provides the high level design of SONiC dual toR solution, support
   - [3.4 Orchagent](#34-orchagent)
     - [3.4.1 IPinIP tunnel](#341-ipinip-tunnel)
     - [3.4.2 Flow Diagram and Orch Components](#342-flow-diagram-and-orch-components)
+    - [3.4.3 Prefix Based Neighbor Architecture](#343-prefix-based-neighbor-architecture)
   - [3.5 Transceiver Daemon](#35-transceiver-daemon)
     - [3.5.1 Cable Control through gRPC](#351-cable-control-through-grpc)
   - [3.6 State Transition Flow](#36-state-transition-flow)
@@ -55,6 +57,8 @@ This document provides the high level design of SONiC dual toR solution, support
   - [3.9 Command Line](#39-command-line)
     - [3.9.1 Show mux status](#391-show-mux-status)
     - [3.9.2 Show mux config](#392-show-mux-config)
+    - [3.9.3 Show mux tunnel-route](#393-show-mux-tunnel-route)
+    - [3.9.4 Config mux mode](#394-config-mux-mode)
 
 [4 Warm Reboot Support](#4-warm-reboot-support)
 
@@ -423,8 +427,29 @@ TunnelOrch will subscribe to `MUX_TUNNEL` table and create tunnel, tunnel termin
 
 1. MuxOrch   
 MuxOrch will listen to state changes from linkmgrd and does the following at a high-level:
-    * Enable / disable neighbor entry.   
-    * Add / remove tunnel routes.
+    * Update neighbor prefix routes with neighbor nexthop or tunnel nexthop.   
+
+#### 3.4.3 Prefix Based Neighbor Architecture
+In the traditional approach, adding a neighbor involved creating a SAI neighbor and a nexthop, which implicitly creates a host route (/32 for IPv4, /128 for IPv6) in the SDK that points directly to the neighbor nexthop. With prefix-based neighbors:
+
+* **Neighbor Entry**: The neighbor entry is created with `SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE=true`, which prevents automatic host route creation.
+* **Separate Prefix Route**: A separate /32 (IPv4) or /128 (IPv6) prefix route is explicitly created that points to the neighbor as its nexthop.
+* **Nexthop Flexibility**: The prefix route's nexthop can be dynamically updated between:
+  - **Direct neighbor nexthop**: Points directly to the neighbor entry (active state)
+  - **Tunnel nexthop**: Points to the IPinIP tunnel nexthop (standby state)
+
+**Implementation Details:**
+* When a mux port neighbor is created, the `SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE` attribute is set to prevent automatic host route creation.
+* A corresponding prefix route (server_ip/32 or server_ipv6/128) is created separately with the neighbor as the initial nexthop.
+* **During active to standby transition**: The prefix route's nexthop is updated from the direct neighbor nexthop to the tunnel nexthop, redirecting traffic through the IPinIP tunnel to the peer ToR.
+* **During standby to active transition**: The prefix route's nexthop is updated from the tunnel nexthop back to the direct neighbor nexthop, allowing direct traffic forwarding to the server.
+* The neighbor entry itself remains persistent throughout state transitions, improving stability and performance.
+
+**Traffic Forwarding Behavior:**
+* **Active State**: Server traffic flows: `Incoming packet → Prefix route lookup → Direct neighbor nexthop → Server`
+* **Standby State**: Server traffic flows: `Incoming packet → Prefix route lookup → Tunnel nexthop → IPinIP tunnel → Peer ToR → Server`
+
+This optimization maintains the same traffic forwarding behavior while significantly reducing the complexity and overhead of mux state transitions by eliminating the need for neighbor entry add/remove operations.
 
 ### 3.5 Transceiver Daemon
 #### 3.5.1 Cable Control through gRPC  
@@ -547,6 +572,43 @@ Ethernet4   auto     192.168.0.2/32   fc02:1000::2/128   active-active  192.168.
 Ethernet8   auto     192.168.0.4/32   fc02:1000::4/128   active-active  192.168.0.5/32
 ```
 
+#### 3.9.3 Show mux tunnel-route
+`show mux tunnel-route` returns tunnel routes that have been created for mux ports. 
+
+For each mux port, there can be 3 entries: `server_ipv4`, `server_ipv6`, `soc_ipv4`. For each entry, if tunnel route is created in `kernel` or `asic`, you will see `added` in command output, if not, you will see `-`. If no tunnel route is created for any of the 3 entries, mux port won't show in the command output. 
+
+* Usage:  
+```
+show mux tunnel-route [OPTIONS] <port_name>
+
+show muxcable tunnel-route <port_name>
+```
+* Options:
+```
+--json          display the output in json format
+```
+* Example
+```
+$ show mux tunnel-route Ethernet44
+PORT        DEST_TYPE    DEST_ADDRESS       kernel    asic
+----------  -----------  -----------------  --------  ------
+Ethernet44  server_ipv4  192.168.0.22/32    added     added
+Ethernet44  server_ipv6  fc02:1000::16/128  added     added
+Ethernet44  soc_ipv4     192.168.0.23/32    -         added
+```
+
+#### 3.9.4 Config mux mode
+`config mux mode` configures the operational mux mode for specified port.
+```
+# config mux mode <operation_status> <port_name>
+
+argument "<operation_status>" is  choose from:
+        active,
+        auto,
+        manual,
+        standby,
+        detach.
+```
 
 ## 4 Warm Reboot Support
 TBD
